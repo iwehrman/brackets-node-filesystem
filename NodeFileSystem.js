@@ -247,6 +247,22 @@ define(function (require, exports, module) {
                 callback(_mapNodeError(err));
             });
     }
+
+    function readAllFiles(paths, options, callback) {
+        var encoding = "utf8";
+        
+        if (typeof options === "function") {
+            callback = options;
+        } else {
+            encoding = options.encoding || "utf8";
+        }
+
+        _execWhenConnected("readAllFiles", [paths, encoding],
+            callback.bind(undefined, null),
+            function (err) {
+                callback(_mapNodeError(err));
+            });
+    }
     
     function writeFile(path, data, options, callback) {
         var encoding = "utf8";
@@ -390,6 +406,7 @@ define(function (require, exports, module) {
     exports.rename          = rename;
     exports.stat            = stat;
     exports.readFile        = readFile;
+    exports.readAllFiles    = readAllFiles;
     exports.writeFile       = writeFile;
     exports.chmod           = chmod;
     exports.unlink          = unlink;

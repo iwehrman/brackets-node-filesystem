@@ -68,11 +68,11 @@ function strencode(data) {
     return unescape(encodeURIComponent(JSON.stringify(data)));
 }
 
-function readFileCmd(path, encoding, callback) {
+function _readFileHelper(path, encoding) {
     var readPromise = fs.readFileAsync(path),
         statPromise = fs.statAsync(path);
     
-    Promise.join(readPromise, statPromise)
+    return Promise.join(readPromise, statPromise)
         .spread(function (data, stats) {
             if (isBinaryFile(data, stats.size)) {
                 return Promise.rejected("Binary file");
@@ -80,6 +80,26 @@ function readFileCmd(path, encoding, callback) {
                 var utf8Data = data.toString(encoding),
                     encodedData = strencode(utf8Data);
                 return _addStats({data: encodedData}, stats);
+            }
+        });
+}
+
+function readFileCmd(path, encoding, callback) {
+    return _readFileHelper(path, encoding)
+        .nodeify(callback);
+}
+
+function readAllFilesCmd(paths, encoding, callback) {
+    var allPromises = paths.map(function (path) {
+        return _readFileHelper(path, encoding);
+    });
+    
+    return Promise.settle(allPromises)
+        .map(function (inspector) {
+            if (inspector.isFulfilled()) {
+                return inspector.value();
+            } else {
+                return {err: inspector.error()};
             }
         })
         .nodeify(callback);
@@ -235,6 +255,27 @@ function init(domainManager) {
             name: "statObjs",
             type: "{data: string, isFile: boolean, mtime: number, size: number}",
             description: "An object that contains data and stat information"
+        }]
+    );
+    domainManager.registerCommand(
+        "fileSystem",
+        "readAllFiles",
+        readAllFilesCmd,
+        true,
+        "Read the contents of all files",
+        [{
+            name: "paths",
+            type: "Array.<string>",
+            description: "absolute filesystem paths of the files to read"
+        }, {
+            name: "encoding",
+            type: "string",
+            description: "encoding with which to read the files"
+        }],
+        [{
+            name: "results",
+            type: "Array.<{err: string, data: string}>",
+            description: "An array of objects that contain read err or file data"
         }]
     );
     domainManager.registerCommand(
