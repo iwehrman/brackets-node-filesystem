@@ -23,7 +23,7 @@
 
 
 /*jslint vars: true, plusplus: true, devel: true, nomen: true, regexp: true, indent: 4, maxerr: 50 */
-/*global define, appshell, $, window, escape */
+/*global define, appshell, $, window, escape, setTimeout */
 
 define(function (require, exports, module) {
     "use strict";
@@ -124,22 +124,70 @@ define(function (require, exports, module) {
     $(_nodeConnection).on("close", function (promise) {
         _nodeConnectionPromise = _connectToNode();
     });
+    
+    var SIMULATED_LATENCY_DELAY = -1,
+        MAX_CONNECTIONS = 6;
+
+    var _waitingRequests = [],
+        _pendingRequests = {},
+        _pendingRequestCount = 0,
+        _requestCounter = 0;
+
+    function _dequeueRequest() {
+        if (_waitingRequests.length > 0) {
+            if (_pendingRequestCount <= MAX_CONNECTIONS) {
+                var request = _waitingRequests[0],
+                    id = _requestCounter++;
+                
+                _waitingRequests.shift();
+                _pendingRequestCount++;
+                _pendingRequests[id] = request;
+                
+                setTimeout(function () {
+                    request().always(function () {
+                        _pendingRequestCount--;
+                        delete _pendingRequests[id];
+                        setTimeout(_dequeueRequest, 0);
+                    });
+                }, SIMULATED_LATENCY_DELAY);
+                
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    function _enqueueRequest(fn) {
+        _waitingRequests.push(fn);
+        
+        if (_waitingRequests.length > 1 || !_dequeueRequest()) {
+            console.log("Delaying request: ", _waitingRequests.length, _pendingRequestCount);
+        }
+    }
 
     function _execWhenConnected(name, args, callback, errback) {
         function execConnected() {
             var domain = _nodeConnection.domains.fileSystem,
                 fn = domain[name];
 
-            fn.apply(domain, args)
+            return fn.apply(domain, args)
                 .done(callback)
                 .fail(errback);
         }
+        
+        function execConnectedWithDelay() {
+            if (SIMULATED_LATENCY_DELAY > 0) {
+                _enqueueRequest(execConnected);
+            } else {
+                execConnected();
+            }
+        }
 
         if (_nodeConnection.connected()) {
-            execConnected();
+            execConnectedWithDelay();
         } else {
             _nodeConnectionPromise
-                .done(execConnected)
+                .done(execConnectedWithDelay)
                 .fail(errback);
         }
     }
