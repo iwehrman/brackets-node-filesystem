@@ -54,6 +54,8 @@ function readdirCmd(path, callback) {
                     return inspectors.reduce(function (total, inspector, index) {
                         if (inspector.isFulfilled()) {
                             total.push(_addStats({name: names[index]}, inspector.value()));
+                        } else {
+                            total.push({name: names[index], err: inspector.error()});
                         }
                         return total;
                     }, []);

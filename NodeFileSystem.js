@@ -185,7 +185,11 @@ define(function (require, exports, module) {
                 var names = [],
                     stats = statObjs.map(function (statObj) {
                         names.push(statObj.name);
-                        return _mapNodeStats(statObj);
+                        if (statObj.err) {
+                            return _mapNodeError(statObj.err);
+                        } else {
+                            return _mapNodeStats(statObj);
+                        }
                     });
                 callback(null, names, stats);
             }, function (err) {
