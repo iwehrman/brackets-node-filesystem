@@ -306,7 +306,14 @@ define(function (require, exports, module) {
         }
 
         _execWhenConnected("readAllFiles", [paths, encoding],
-            callback.bind(undefined, null),
+            function (results) {
+                results.forEach(function (obj) {
+                    if (obj.data) {
+                        obj.data = strdecode(obj.data);
+                    }
+                });
+                callback(null, results);
+            },
             function (err) {
                 callback(_mapNodeError(err));
             });
