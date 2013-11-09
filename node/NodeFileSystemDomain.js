@@ -42,18 +42,38 @@ function _addStats(obj, stats) {
     return obj;
 }
 
+function _statHelper(path) {
+    return fs.lstatAsync(path)
+        .then(function (lstats) {
+            var init;
+            if (lstats.isSymbolicLink()) {
+                var pathPromise = fs.realpathAsync(path),
+                    statPromise = fs.statAsync(path);
+                
+                return Promise.join(pathPromise, statPromise)
+                    .spread(function (realpath, stats) {
+                        return _addStats({realpath: realpath}, stats);
+                    });
+            } else {
+                return _addStats({}, lstats);
+            }
+        });
+}
+
 function readdirCmd(path, callback) {
     fs.readdirAsync(path)
         .then(function (names) {
             var statPromises = names.map(function (name) {
-                return fs.statAsync([path, name].join(""));
+                return _statHelper(path + name);
             });
             
             return Promise.settle(statPromises)
                 .then(function (inspectors) {
                     return inspectors.reduce(function (total, inspector, index) {
                         if (inspector.isFulfilled()) {
-                            total.push(_addStats({name: names[index]}, inspector.value()));
+                            var stats = inspector.value();
+                            stats.name = names[index];
+                            total.push(stats);
                         } else {
                             total.push({name: names[index], err: inspector.error()});
                         }
@@ -70,7 +90,7 @@ function strencode(data) {
 
 function _readFileHelper(path, encoding) {
     var readPromise = fs.readFileAsync(path),
-        statPromise = fs.statAsync(path);
+        statPromise = _statHelper(path);
     
     return Promise.join(readPromise, statPromise)
         .spread(function (data, stats) {
@@ -79,13 +99,15 @@ function _readFileHelper(path, encoding) {
             } else {
                 var utf8Data = data.toString(encoding),
                     encodedData = strencode(utf8Data);
-                return _addStats({data: encodedData}, stats);
+                stats.data = encodedData;
+
+                return stats;
             }
         });
 }
 
 function readFileCmd(path, encoding, callback) {
-    return _readFileHelper(path, encoding)
+    _readFileHelper(path, encoding)
         .nodeify(callback);
 }
 
@@ -94,7 +116,7 @@ function readAllFilesCmd(paths, encoding, callback) {
         return _readFileHelper(path, encoding);
     });
     
-    return Promise.settle(allPromises)
+    Promise.settle(allPromises)
         .map(function (inspector) {
             if (inspector.isFulfilled()) {
                 return inspector.value();
@@ -106,10 +128,7 @@ function readAllFilesCmd(paths, encoding, callback) {
 }
 
 function statCmd(path, callback) {
-    fs.statAsync(path)
-        .then(function (stats) {
-            return _addStats({}, stats);
-        })
+    _statHelper(path)
         .nodeify(callback);
 }
 
@@ -120,10 +139,10 @@ function existsCmd(path, callback) {
 function writeFileCmd(path, data, encoding, callback) {
     existsCmd(path, function (exists) {
         fs.writeFileAsync(path, data, {encoding: encoding})
-            .then(function () {
-                return fs.statAsync(path).then(function (stats) {
-                    return _addStats({created: !exists}, stats);
-                });
+            .then(_statHelper.bind(undefined, path))
+            .then(function (stats) {
+                stats.created = !exists;
+                return stats;
             })
             .nodeify(callback);
     });
@@ -131,11 +150,7 @@ function writeFileCmd(path, data, encoding, callback) {
 
 function mkdirCmd(path, mode, callback) {
     fs.mkdirAsync(path, mode)
-        .then(function () {
-            return fs.statAsync(path).then(function (stats) {
-                return _addStats({}, stats);
-            });
-        })
+        .then(_statHelper.bind(undefined, path))
         .nodeify(callback);
 }
 
@@ -291,7 +306,7 @@ function init(domainManager) {
         }],
         [{
             name: "statObj",
-            type: "{isFile: boolean, mtime: number, size: number}",
+            type: "{isFile: boolean, mtime: number, size: number, realpath: ?string}",
             description: "An object that contains stat information"
         }]
     );
