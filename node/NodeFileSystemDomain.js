@@ -45,7 +45,6 @@ function _addStats(obj, stats) {
 function _statHelper(path) {
     return fs.lstatAsync(path)
         .then(function (lstats) {
-            var init;
             if (lstats.isSymbolicLink()) {
                 var pathPromise = fs.realpathAsync(path),
                     statPromise = fs.statAsync(path);
