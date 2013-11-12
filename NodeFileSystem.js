@@ -93,7 +93,7 @@ define(function (require, exports, module) {
             isFile: stats.isFile,
             mtime: new Date(stats.mtime),
             size: stats.size,
-            realpath: stats.realpath
+            realPath: stats.realpath
         };
 
         return new FileSystemStats(options);
