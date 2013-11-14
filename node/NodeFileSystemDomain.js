@@ -43,6 +43,12 @@ function _addStats(obj, stats) {
 }
 
 function _statHelper(path) {
+    var last = path.length - 1;
+
+    if (path[last] === "/") {
+        path = path.substr(0, last);
+    }
+
     return fs.lstatAsync(path)
         .then(function (lstats) {
             if (lstats.isSymbolicLink()) {
@@ -51,6 +57,9 @@ function _statHelper(path) {
                 
                 return Promise.join(pathPromise, statPromise)
                     .spread(function (realpath, stats) {
+                        if (stats.isDirectory() && realpath[realpath - 1] !== "/") {
+                            realpath += "/";
+                        }
                         return _addStats({realpath: realpath}, stats);
                     });
             } else {
