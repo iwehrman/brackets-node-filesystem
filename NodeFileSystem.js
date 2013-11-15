@@ -224,8 +224,12 @@ define(function (require, exports, module) {
     
     function exists(path, callback) {
         _execWhenConnected("exists", [path],
-            callback,
-            callback.bind(undefined, false));
+            function (exists) {
+                callback(null, _mapNodeError(err));
+            } 
+            function (err) {
+                callback(_mapNodeError(err))
+            });
     }
     
     function readdir(path, callback) {
