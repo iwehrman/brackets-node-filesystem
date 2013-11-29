@@ -225,10 +225,10 @@ define(function (require, exports, module) {
     function exists(path, callback) {
         _execWhenConnected("exists", [path],
             function (exists) {
-                callback(null, _mapNodeError(err));
-            } 
+                callback(null, exists);
+            },
             function (err) {
-                callback(_mapNodeError(err))
+                callback(_mapNodeError(err));
             });
     }
     
