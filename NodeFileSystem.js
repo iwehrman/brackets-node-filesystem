@@ -28,23 +28,157 @@
 define(function (require, exports, module) {
     "use strict";
     
-    var FileUtils           = require("file/FileUtils"),
-        FileSystemStats     = require("filesystem/FileSystemStats"),
+    var FileSystemStats     = require("filesystem/FileSystemStats"),
         FileSystemError     = require("filesystem/FileSystemError"),
+        FileUtils           = require("file/FileUtils"),
         NodeConnection      = require("utils/NodeConnection");
     
-    /**
-     * @const
-     * Amount of time to wait before automatically rejecting the connection
-     * deferred. If we hit this timeout, we'll never have a node connection
-     * for the file watcher in this run of Brackets.
-     */
-    var NODE_CONNECTION_TIMEOUT = 30000,    // 30 seconds - TODO: share with StaticServer & Package?
-        FILE_WATCHER_BATCH_TIMEOUT = 200;   // 200ms - granularity of file watcher changes
+    var FILE_WATCHER_BATCH_TIMEOUT = 200;   // 200ms - granularity of file watcher changes
     
     var _changeCallback,            // Callback to notify FileSystem of watcher changes
+        _offlineCallback,           // Callback to notify FileSystem that watchers are offline
         _changeTimeout,             // Timeout used to batch up file watcher changes
         _pendingChanges = {};       // Pending file watcher changes
+    
+    var _bracketsPath   = FileUtils.getNativeBracketsDirectoryPath(),
+        _modulePath     = FileUtils.getNativeModuleDirectoryPath(module),
+        _nodePath       = "node/NodeFileSystemDomain",
+        _domainPath     = [_bracketsPath, _modulePath, _nodePath].join("/"),
+        _nodeConnection = new NodeConnection(),
+        _domainsLoaded  = false;
+    
+    function _enqueueChange(change, needsStats) {
+        _pendingChanges[change] = _pendingChanges[change] || needsStats;
+
+        if (!_changeTimeout) {
+            _changeTimeout = window.setTimeout(function () {
+                if (_changeCallback) {
+                    Object.keys(_pendingChanges).forEach(function (path) {
+                        var needsStats = _pendingChanges[path];
+                        if (needsStats) {
+                            exports.stat(path, function (err, stats) {
+                                if (err) {
+                                    console.warn("Unable to stat changed path: ", path, err);
+                                    return;
+                                }
+                                _changeCallback(path, stats);
+                            });
+                        } else {
+                            _changeCallback(path);
+                        }
+                    });
+                }
+                
+                _changeTimeout = null;
+                _pendingChanges = {};
+            }, FILE_WATCHER_BATCH_TIMEOUT);
+        }
+    }
+    
+    function _fileWatcherChange(evt, path, event, filename) {
+        var change;
+
+        if (event === "change") {
+            // Only register change events if filename is passed
+            if (filename) {
+                // an existing file was created; stats are needed
+                change = path + filename;
+                _enqueueChange(change, true);
+            }
+        } else if (event === "rename") {
+            // a new file was created; no stats are needed
+            change = path;
+            _enqueueChange(change, false);
+        }
+    }
+    
+    var SIMULATED_LATENCY_DELAY = -1,
+        MAX_CONNECTIONS = 6;
+
+    var _waitingRequests = [],
+        _pendingRequests = {},
+        _pendingRequestCount = 0,
+        _requestCounter = 0;
+
+    function _dequeueRequest() {
+        if (_waitingRequests.length > 0) {
+            if (_pendingRequestCount <= MAX_CONNECTIONS) {
+                var request = _waitingRequests[0],
+                    id = _requestCounter++;
+                
+                _waitingRequests.shift();
+                _pendingRequestCount++;
+                _pendingRequests[id] = request;
+                
+                setTimeout(function () {
+                    request().always(function () {
+                        _pendingRequestCount--;
+                        delete _pendingRequests[id];
+                        setTimeout(_dequeueRequest, 0);
+                    });
+                }, SIMULATED_LATENCY_DELAY);
+                
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    function _enqueueRequest(fn) {
+        _waitingRequests.push(fn);
+        
+        if (_waitingRequests.length > 1 || !_dequeueRequest()) {
+            console.log("Delaying request: ", _waitingRequests.length, _pendingRequestCount);
+        }
+    }
+    
+    function _loadDomains() {
+        return _nodeConnection
+            .loadDomains(_domainPath, true)
+            .done(function () {
+                _domainsLoaded = true;
+            });
+    }
+    
+    var _nodeConnectionPromise = _nodeConnection.connect(true).then(_loadDomains);
+    
+    $(_nodeConnection).on("fileSystem.change", _fileWatcherChange);
+    
+    $(_nodeConnection).on("close", function (event, promise) {
+        _domainsLoaded = false;
+        _nodeConnectionPromise = promise.then(_loadDomains);
+        
+        if (_offlineCallback) {
+            _offlineCallback();
+        }
+    });
+    
+    function _execWhenConnected(name, args, callback, errback) {
+        function execConnected() {
+            var domain = _nodeConnection.domains.fileSystem,
+                fn = domain[name];
+
+            return fn.apply(domain, args)
+                .done(callback)
+                .fail(errback);
+        }
+        
+        function execConnectedWithDelay() {
+            if (SIMULATED_LATENCY_DELAY > 0) {
+                _enqueueRequest(execConnectedWithDelay);
+            } else {
+                execConnectedWithDelay();
+            }
+        }
+        
+        if (_domainsLoaded && _nodeConnection.connected()) {
+            execConnected();
+        } else {
+            _nodeConnectionPromise
+                .done(execConnected)
+                .fail(errback);
+        }
+    }
 
     function _mapError(err) {
         if (!err) {
@@ -93,108 +227,11 @@ define(function (require, exports, module) {
             isFile: stats.isFile,
             mtime: new Date(stats.mtime),
             size: stats.size,
+            hash: stats.mtime,
             realPath: stats.realpath
         };
 
         return new FileSystemStats(options);
-    }
-    
-    /** Returns the path of the item's containing directory (item may be a file or a directory) */
-    function _parentPath(path) {
-        var lastSlash = path.lastIndexOf("/");
-        if (lastSlash === path.length - 1) {
-            lastSlash = path.lastIndexOf("/", lastSlash - 1);
-        }
-        return path.substr(0, lastSlash + 1);
-    }
-    
-    var _bracketsPath = FileUtils.getNativeBracketsDirectoryPath(),
-        _modulePath = FileUtils.getNativeModuleDirectoryPath(module),
-        _nodePath = "node/NodeFileSystemDomain",
-        _domainPath = [_bracketsPath, _modulePath, _nodePath].join("/");
-    
-    var _nodeConnection = new NodeConnection(),
-        _nodeConnectionPromise = null;
-    
-    function _connectToNode() {
-        return _nodeConnection
-            .connect(true)
-            .then(_nodeConnection.loadDomains.bind(_nodeConnection, _domainPath, true));
-    }
-
-    $(_nodeConnection).on("close", function (promise) {
-        _nodeConnectionPromise = _connectToNode();
-    });
-    
-    var SIMULATED_LATENCY_DELAY = -1,
-        MAX_CONNECTIONS = 6;
-
-    var _waitingRequests = [],
-        _pendingRequests = {},
-        _pendingRequestCount = 0,
-        _requestCounter = 0;
-
-    function _dequeueRequest() {
-        if (_waitingRequests.length > 0) {
-            if (_pendingRequestCount <= MAX_CONNECTIONS) {
-                var request = _waitingRequests[0],
-                    id = _requestCounter++;
-                
-                _waitingRequests.shift();
-                _pendingRequestCount++;
-                _pendingRequests[id] = request;
-                
-                setTimeout(function () {
-                    request().always(function () {
-                        _pendingRequestCount--;
-                        delete _pendingRequests[id];
-                        setTimeout(_dequeueRequest, 0);
-                    });
-                }, SIMULATED_LATENCY_DELAY);
-                
-                return true;
-            }
-        }
-        return false;
-    }
-    
-    function _enqueueRequest(fn) {
-        _waitingRequests.push(fn);
-        
-        if (_waitingRequests.length > 1 || !_dequeueRequest()) {
-            console.log("Delaying request: ", _waitingRequests.length, _pendingRequestCount);
-        }
-    }
-
-    function _execWhenConnected(name, args, callback, errback) {
-        function execConnected() {
-            var domain = _nodeConnection.domains.fileSystem,
-                fn = domain[name];
-
-            return fn.apply(domain, args)
-                .done(callback)
-                .fail(errback);
-        }
-        
-        function execConnectedWithDelay() {
-            if (SIMULATED_LATENCY_DELAY > 0) {
-                _enqueueRequest(execConnected);
-            } else {
-                execConnected();
-            }
-        }
-
-        if (_nodeConnection.connected()) {
-            execConnectedWithDelay();
-        } else {
-            _nodeConnectionPromise
-                .done(execConnectedWithDelay)
-                .fail(errback);
-        }
-    }
-    
-    function init(callback) {
-        _nodeConnectionPromise = _connectToNode().done(callback);
     }
     
     function _wrap(cb) {
@@ -233,6 +270,7 @@ define(function (require, exports, module) {
     }
     
     function readdir(path, callback) {
+        // TODO: Return stats errors
         _execWhenConnected("readdir", [path],
             function (statObjs) {
                 var names = [],
@@ -259,9 +297,6 @@ define(function (require, exports, module) {
         _execWhenConnected("mkdir", [path, mode],
             function (statObj) {
                 callback(null, _mapNodeStats(statObj));
-                
-                 // Fake a file-watcher result until real watchers respond quickly
-                _changeCallback(_parentPath(path));
             }, function (err) {
                 callback(_mapNodeError(err));
             });
@@ -271,7 +306,6 @@ define(function (require, exports, module) {
         _execWhenConnected("rename", [oldPath, newPath],
             function () {
                 callback(null);
-                // No need to fake a file-watcher result here: FileSystem already updates index on rename()                
             }, function (err) {
                 callback(_mapNodeError(err));
             });
@@ -282,14 +316,8 @@ define(function (require, exports, module) {
     }
 
     function readFile(path, options, callback) {
-        var encoding = "utf8";
+        var encoding = options.encoding || "utf8";
         
-        if (typeof options === "function") {
-            callback = options;
-        } else {
-            encoding = options.encoding || "utf8";
-        }
-
         _execWhenConnected("readFile", [path, encoding],
             function (statObj) {
                 var data = statObj.data,
@@ -302,14 +330,8 @@ define(function (require, exports, module) {
     }
 
     function readAllFiles(paths, options, callback) {
-        var encoding = "utf8";
+        var encoding = options.encoding || "utf8";
         
-        if (typeof options === "function") {
-            callback = options;
-        } else {
-            encoding = options.encoding || "utf8";
-        }
-
         _execWhenConnected("readAllFiles", [paths, encoding],
             function (results) {
                 results.forEach(function (obj) {
@@ -325,139 +347,81 @@ define(function (require, exports, module) {
     }
     
     function writeFile(path, data, options, callback) {
-        var encoding = "utf8";
+        var encoding = options.encoding || "utf8";
         
-        if (typeof options === "function") {
-            callback = options;
-        } else {
-            encoding = options.encoding || "utf8";
+        function _finishWrite(created) {
+            _execWhenConnected("writeFile", [path, data, encoding],
+                function (statObj) {
+                    var created = statObj.created,
+                        stat = _mapNodeStats(statObj);
+                    
+                    callback(null, stat, created);
+                }, function (err) {
+                    callback(_mapNodeError(err));
+                });
         }
-
-        _execWhenConnected("writeFile", [path, data, encoding],
-            function (statObj) {
-                var created = statObj.created,
-                    stat = _mapNodeStats(statObj);
-                
-                callback(null, stat);
-                
-                // Fake a file-watcher result until real watchers respond quickly
-                if (!created) {
-                    _changeCallback(path, stat);        // existing file modified
-                } else {
-                    _changeCallback(_parentPath(path)); // new file created
+        
+        // TODO: Perform all the hash logic on the Node process
+        stat(path, function (err, stats) {
+            if (err) {
+                switch (err) {
+                case FileSystemError.NOT_FOUND:
+                    _finishWrite(true);
+                    break;
+                default:
+                    callback(err);
                 }
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+                return;
+            }
+            
+            if (options.hasOwnProperty("hash") && options.hash !== stats._hash) {
+                console.warn("Blind write attempted: ", path, stats._hash, options.hash);
+                callback(FileSystemError.CONTENTS_MODIFIED);
+                return;
+            }
+            
+            _finishWrite(false);
+        });
     }
     
-    function chmod(path, mode, callback) {
-        _execWhenConnected("chmod", [path, mode],
-            callback.bind(undefined, null),
+    function unlink(path, callback) {
+        _execWhenConnected("unlink", [path],
+            callback,
             function (err) {
                 callback(_mapNodeError(err));
             });
     }
     
-    function unlink(path, callback) {
-        _execWhenConnected("unlink", [path],
-            function () {
-                callback(null);
-                
-                // Fake a file-watcher result until real watchers respond quickly
-                _changeCallback(_parentPath(path));
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+    function initWatchers(changeCallback, offlineCallback) {
+        _changeCallback = changeCallback;
+        _offlineCallback = offlineCallback;
     }
     
-    /* File watchers are temporarily disabled
-    function _notifyChanges(callback) {
-        var change;
+    function watchPath(path, callback) {
+        callback = callback || function () {};
         
-        for (change in _pendingChanges) {
-            if (_pendingChanges.hasOwnProperty(change)) {
-                callback(change);
-                delete _pendingChanges[change];
-            }
-        }
+        _execWhenConnected("watchPath", [path],
+                           callback.bind(undefined, null),
+                           callback);
     }
     
-    function _fileWatcherChange(evt, path, event, filename) {
-        var change;
+    function unwatchPath(path, callback) {
+        callback = callback || function () {};
         
-        if (event === "change") {
-            // Only register change events if filename is passed
-            if (filename) {
-                change = path + "/" + filename;
-            }
-        } else if (event === "rename") {
-            change = path;
-        }
-        if (change && !_pendingChanges.hasOwnProperty(change)) {
-            if (!_changeTimeout) {
-                _changeTimeout = window.setTimeout(function () {
-                    _changeTimeout = null;
-                    _notifyChanges(_fileWatcherChange.callback);
-                }, FILE_WATCHER_BATCH_TIMEOUT);
-            }
-            
-            _pendingChanges[change] = true;
-        }
+        _execWhenConnected("unwatchPath", [path],
+                           callback.bind(undefined, null),
+                           callback);
     }
-    */
     
-    function initWatchers(callback) {
-        _changeCallback = callback;
+    function unwatchAll(callback) {
+        callback = callback || function () {};
         
-        /* File watchers are temporarily disabled. For now, send
-           a "wholesale" change when the window is focused. */
-        $(window).on("focus", function () {
-            callback(null);
-        });
-        
-        /*
-        _nodeConnectionPromise.done(function (nodeConnection) {
-            if (nodeConnection.connected()) {
-                _fileWatcherChange.callback = callback;
-                $(nodeConnection).on("fileWatcher.change", _fileWatcherChange);
-            }
-        });
-        */
-    }
-    
-    function watchPath(path) {
-        /*
-        _nodeConnectionPromise.done(function (nodeConnection) {
-            if (nodeConnection.connected()) {
-                nodeConnection.domains.fileWatcher.watchPath(path);
-            }
-        });
-        */
-    }
-    
-    function unwatchPath(path) {
-        /*
-        _nodeConnectionPromise.done(function (nodeConnection) {
-            if (nodeConnection.connected()) {
-                nodeConnection.domains.fileWatcher.unwatchPath(path);
-            }
-        });
-        */
-    }
-    
-    function unwatchAll() {
-        /*
-        _nodeConnectionPromise.done(function (nodeConnection) {
-            if (nodeConnection.connected()) {
-                nodeConnection.domains.fileWatcher.unwatchAll();
-            }
-        });
-        */
+        _execWhenConnected("watchPath", [],
+                           callback.bind(undefined, null),
+                           callback);
     }
     
     // Export public API
-    exports.init            = init;
     exports.showOpenDialog  = showOpenDialog;
     exports.showSaveDialog  = showSaveDialog;
     exports.exists          = exists;
@@ -468,10 +432,15 @@ define(function (require, exports, module) {
     exports.readFile        = readFile;
     exports.readAllFiles    = readAllFiles;
     exports.writeFile       = writeFile;
-    exports.chmod           = chmod;
     exports.unlink          = unlink;
     exports.initWatchers    = initWatchers;
     exports.watchPath       = watchPath;
     exports.unwatchPath     = unwatchPath;
     exports.unwatchAll      = unwatchAll;
+    
+    // Node only supports recursive file watching on the Darwin
+    exports.recursiveWatch = appshell.platform === "mac";
+    
+    // Only perform UNC path normalization on Windows
+    exports.normalizeUNCPaths = appshell.platform === "win";
 });

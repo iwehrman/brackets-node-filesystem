@@ -30,7 +30,12 @@
 var Promise = require("bluebird"),
     callbackfs = require("fs-extra"),
     fs = Promise.promisifyAll(callbackfs),
-    isBinaryFile = require("isbinaryfile");
+    isBinaryFile = require("isbinaryfile"),
+    fsevents;
+
+if (process.platform === "darwin") {
+    fsevents = require("fsevents");
+}
 
 var _domainManager,
     _watcherMap = {};
@@ -92,7 +97,7 @@ function readdirCmd(path, callback) {
         .nodeify(callback);
 }
 
-function strencode(data) {
+function _strencode(data) {
     return unescape(encodeURIComponent(JSON.stringify(data)));
 }
 
@@ -106,7 +111,7 @@ function _readFileHelper(path, encoding) {
                 return Promise.rejected("Binary file");
             } else {
                 var utf8Data = data.toString(encoding),
-                    encodedData = strencode(utf8Data);
+                    encodedData = _strencode(utf8Data);
                 stats.data = encodedData;
 
                 return stats;
@@ -167,11 +172,6 @@ function renameCmd(oldPath, newPath, callback) {
         .nodeify(callback);
 }
 
-function chmodCmd(path, mode, callback) {
-    fs.chmodAsync(path, mode)
-        .nodeify(callback);
-}
-
 function unlinkCmd(path, callback) {
     fs.removeAsync(path)
         .nodeify(callback);
@@ -183,10 +183,14 @@ function unlinkCmd(path, callback) {
  */
 function unwatchPath(path) {
     var watcher = _watcherMap[path];
-    
+
     if (watcher) {
         try {
-            watcher.close();
+            if (fsevents) {
+                watcher.stop();
+            } else {
+                watcher.close();
+            }
         } catch (err) {
             console.warn("Failed to unwatch file " + path + ": " + (err && err.message));
         } finally {
@@ -205,10 +209,24 @@ function watchPath(path) {
     }
     
     try {
-        var watcher = fs.watch(path, {persistent: false}, function (event, filename) {
-            // File/directory changes are emitted as "change" events on the fileSystem domain.
-            _domainManager.emitEvent("fileSystem", "change", [path, event, filename]);
-        });
+        var watcher;
+        
+        if (fsevents) {
+            watcher = fsevents(path);
+            watcher.on("change", function (filename, info) {
+                var lastIndex = filename.lastIndexOf("/") + 1,
+                    parent = lastIndex && filename.substring(0, lastIndex),
+                    name = lastIndex && filename.substring(lastIndex),
+                    type = info.event === "modified" ? "change" : "rename";
+                
+                _domainManager.emitEvent("fileSystem", "change", [parent, type, name]);
+            });
+        } else {
+            watcher = fs.watch(path, {persistent: false}, function (event, filename) {
+                // File/directory changes are emitted as "change" events on the fileWatcher domain.
+                _domainManager.emitEvent("fileSystem", "change", [path, event, filename]);
+            });
+        }
 
         _watcherMap[path] = watcher;
         
@@ -383,22 +401,6 @@ function init(domainManager) {
     );
     domainManager.registerCommand(
         "fileSystem",
-        "chmod",
-        chmodCmd,
-        true,
-        "Chnage the mode of the given file",
-        [{
-            name: "path",
-            type: "string",
-            description: "absolute filesystem path of the file or directory"
-        }, {
-            name: "mode",
-            type: "number",
-            description: "mode to which the file or directory should be changed"
-        }]
-    );
-    domainManager.registerCommand(
-        "fileSystem",
         "rename",
         renameCmd,
         true,
@@ -470,4 +472,3 @@ function init(domainManager) {
 }
 
 exports.init = init;
-
