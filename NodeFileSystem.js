@@ -320,10 +320,10 @@ define(function (require, exports, module) {
         
         _execWhenConnected("readFile", [path, encoding],
             function (statObj) {
-                var data = statObj.data,
+                var data = strdecode(statObj.data),
                     stat = _mapNodeStats(statObj);
                 
-                callback(null, strdecode(data), stat);
+                callback(null, data, stat);
             }, function (err) {
                 callback(_mapNodeError(err));
             });
@@ -334,12 +334,17 @@ define(function (require, exports, module) {
         
         _execWhenConnected("readAllFiles", [paths, encoding],
             function (results) {
-                results.forEach(function (obj) {
-                    if (obj.data) {
-                        obj.data = strdecode(obj.data);
+                var mappedResults = results.map(function (obj) {
+                    if (obj.err) {
+                        return _mapNodeError(obj.err);
+                    } else {
+                        var data = strdecode(obj.data),
+                            stat = _mapNodeStats(obj);
+                        
+                        return [data, stat];
                     }
                 });
-                callback(null, results);
+                callback(null, mappedResults);
             },
             function (err) {
                 callback(_mapNodeError(err));
