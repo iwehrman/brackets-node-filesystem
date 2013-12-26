@@ -31,7 +31,7 @@ define(function (require, exports, module) {
     var FileSystemStats     = require("filesystem/FileSystemStats"),
         FileSystemError     = require("filesystem/FileSystemError"),
         FileUtils           = require("file/FileUtils"),
-        NodeConnection      = require("utils/NodeConnection");
+        NodeDomain          = require("utils/NodeDomain");
     
     var FILE_WATCHER_BATCH_TIMEOUT = 200;   // 200ms - granularity of file watcher changes
     
@@ -44,8 +44,7 @@ define(function (require, exports, module) {
         _modulePath     = FileUtils.getNativeModuleDirectoryPath(module),
         _nodePath       = "node/NodeFileSystemDomain",
         _domainPath     = [_bracketsPath, _modulePath, _nodePath].join("/"),
-        _nodeConnection = new NodeConnection(),
-        _domainsLoaded  = false;
+        _nodeDomain     = new NodeDomain("fileSystem", _domainPath);
     
     function _enqueueChange(change, needsStats) {
         _pendingChanges[change] = _pendingChanges[change] || needsStats;
@@ -93,7 +92,7 @@ define(function (require, exports, module) {
     }
     
     var SIMULATED_LATENCY_DELAY = -1,
-        MAX_CONNECTIONS = 6;
+        MAX_CONNECTIONS = -1;
 
     var _waitingRequests = [],
         _pendingRequests = {},
@@ -125,6 +124,11 @@ define(function (require, exports, module) {
     }
     
     function _enqueueRequest(fn) {
+        if (MAX_CONNECTIONS < 0) {
+            fn();
+            return;
+        }
+        
         _waitingRequests.push(fn);
         
         if (_waitingRequests.length > 1 || !_dequeueRequest()) {
@@ -132,54 +136,14 @@ define(function (require, exports, module) {
         }
     }
     
-    function _loadDomains() {
-        return _nodeConnection
-            .loadDomains(_domainPath, true)
-            .done(function () {
-                _domainsLoaded = true;
-            });
-    }
+    $(_nodeDomain).on("change", _fileWatcherChange);
     
-    var _nodeConnectionPromise = _nodeConnection.connect(true).then(_loadDomains);
-    
-    $(_nodeConnection).on("fileSystem.change", _fileWatcherChange);
-    
-    $(_nodeConnection).on("close", function (event, promise) {
-        _domainsLoaded = false;
-        _nodeConnectionPromise = promise.then(_loadDomains);
-        
+    $(_nodeDomain.connection).on("close", function () {
         if (_offlineCallback) {
             _offlineCallback();
         }
     });
     
-    function _execWhenConnected(name, args, callback, errback) {
-        function execConnected() {
-            var domain = _nodeConnection.domains.fileSystem,
-                fn = domain[name];
-
-            return fn.apply(domain, args)
-                .done(callback)
-                .fail(errback);
-        }
-        
-        function execConnectedWithDelay() {
-            if (SIMULATED_LATENCY_DELAY > 0) {
-                _enqueueRequest(execConnectedWithDelay);
-            } else {
-                execConnectedWithDelay();
-            }
-        }
-        
-        if (_domainsLoaded && _nodeConnection.connected()) {
-            execConnected();
-        } else {
-            _nodeConnectionPromise
-                .done(execConnected)
-                .fail(errback);
-        }
-    }
-
     function _mapError(err) {
         if (!err) {
             return null;
@@ -251,41 +215,49 @@ define(function (require, exports, module) {
     }
     
     function stat(path, callback) {
-        _execWhenConnected("stat", [path],
-            function (statObj) {
-                callback(null, _mapNodeStats(statObj));
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("stat", path)
+                .done(function (statObj) {
+                    callback(null, _mapNodeStats(statObj));
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
     
     function exists(path, callback) {
-        _execWhenConnected("exists", [path],
-            function (exists) {
-                callback(null, exists);
-            },
-            function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("exists", path)
+                .done(function (exists) {
+                    callback(null, exists);
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
     
     function readdir(path, callback) {
         // TODO: Return stats errors
-        _execWhenConnected("readdir", [path],
-            function (statObjs) {
-                var names = [],
-                    stats = statObjs.map(function (statObj) {
-                        names.push(statObj.name);
-                        if (statObj.err) {
-                            return _mapNodeError(statObj.err);
-                        } else {
-                            return _mapNodeStats(statObj);
-                        }
-                    });
-                callback(null, names, stats);
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("readdir", path)
+                .done(function (statObjs) {
+                    var names = [],
+                        stats = statObjs.map(function (statObj) {
+                            names.push(statObj.name);
+                            if (statObj.err) {
+                                return _mapNodeError(statObj.err);
+                            } else {
+                                return _mapNodeStats(statObj);
+                            }
+                        });
+                    callback(null, names, stats);
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
     
     function mkdir(path, mode, callback) {
@@ -294,21 +266,27 @@ define(function (require, exports, module) {
             mode = parseInt("0755", 8);
         }
 
-        _execWhenConnected("mkdir", [path, mode],
-            function (statObj) {
-                callback(null, _mapNodeStats(statObj));
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("mkdir", path, mode)
+                .done(function (statObj) {
+                    callback(null, _mapNodeStats(statObj));
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
     
     function rename(oldPath, newPath, callback) {
-        _execWhenConnected("rename", [oldPath, newPath],
-            function () {
-                callback(null);
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("rename", oldPath, newPath)
+                .done(function () {
+                    callback(null);
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
     
     function strdecode(data) {
@@ -318,52 +296,60 @@ define(function (require, exports, module) {
     function readFile(path, options, callback) {
         var encoding = options.encoding || "utf8";
         
-        _execWhenConnected("readFile", [path, encoding],
-            function (statObj) {
-                var data = strdecode(statObj.data),
-                    stat = _mapNodeStats(statObj);
-                
-                callback(null, data, stat);
-            }, function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("readFile", path, encoding)
+                .done(function (statObj) {
+                    var data = strdecode(statObj.data),
+                        stat = _mapNodeStats(statObj);
+                    
+                    callback(null, data, stat);
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
 
     function readAllFiles(paths, options, callback) {
         var encoding = options.encoding || "utf8";
         
-        _execWhenConnected("readAllFiles", [paths, encoding],
-            function (results) {
-                var mappedResults = results.map(function (obj) {
-                    if (obj.err) {
-                        return _mapNodeError(obj.err);
-                    } else {
-                        var data = strdecode(obj.data),
-                            stat = _mapNodeStats(obj);
-                        
-                        return [data, stat];
-                    }
+        _enqueueRequest(function () {
+            _nodeDomain.exec("readAllFiles", paths, encoding)
+                .done(function (results) {
+                    var mappedResults = results.map(function (obj) {
+                        if (obj.err) {
+                            return _mapNodeError(obj.err);
+                        } else {
+                            var data = strdecode(obj.data),
+                                stat = _mapNodeStats(obj);
+                            
+                            return [data, stat];
+                        }
+                    });
+                    callback(null, mappedResults);
+                })
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
                 });
-                callback(null, mappedResults);
-            },
-            function (err) {
-                callback(_mapNodeError(err));
-            });
+        });
     }
     
     function writeFile(path, data, options, callback) {
         var encoding = options.encoding || "utf8";
         
         function _finishWrite(created) {
-            _execWhenConnected("writeFile", [path, data, encoding],
-                function (statObj) {
-                    var created = statObj.created,
-                        stat = _mapNodeStats(statObj);
-                    
-                    callback(null, stat, created);
-                }, function (err) {
-                    callback(_mapNodeError(err));
-                });
+            _enqueueRequest(function () {
+                _nodeDomain.exec("writeFile", path, data, encoding)
+                    .done(function (statObj) {
+                        var created = statObj.created,
+                            stat = _mapNodeStats(statObj);
+                        
+                        callback(null, stat, created);
+                    })
+                    .fail(function (err) {
+                        callback(_mapNodeError(err));
+                    });
+            });
         }
         
         // TODO: Perform all the hash logic on the Node process
@@ -390,11 +376,13 @@ define(function (require, exports, module) {
     }
     
     function unlink(path, callback) {
-        _execWhenConnected("unlink", [path],
-            callback,
-            function (err) {
-                callback(_mapNodeError(err));
-            });
+        _enqueueRequest(function () {
+            _nodeDomain.exec("unlink", path)
+                .done(callback)
+                .fail(function (err) {
+                    callback(_mapNodeError(err));
+                });
+        });
     }
     
     function initWatchers(changeCallback, offlineCallback) {
@@ -405,25 +393,31 @@ define(function (require, exports, module) {
     function watchPath(path, callback) {
         callback = callback || function () {};
         
-        _execWhenConnected("watchPath", [path],
-                           callback.bind(undefined, null),
-                           callback);
+        _enqueueRequest(function () {
+            _nodeDomain.exec("watchPath", path)
+                .done(callback)
+                .fail(callback);
+        });
     }
     
     function unwatchPath(path, callback) {
         callback = callback || function () {};
         
-        _execWhenConnected("unwatchPath", [path],
-                           callback.bind(undefined, null),
-                           callback);
+        _enqueueRequest(function () {
+            _nodeDomain.exec("unwatchPath", path)
+                .done(callback)
+                .fail(callback);
+        });
     }
     
     function unwatchAll(callback) {
         callback = callback || function () {};
         
-        _execWhenConnected("watchPath", [],
-                           callback.bind(undefined, null),
-                           callback);
+        _enqueueRequest(function () {
+            _nodeDomain.exec("watchPath")
+                .done(callback)
+                .fail(callback);
+        });
     }
     
     // Export public API
