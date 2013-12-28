@@ -22,8 +22,8 @@
  */
 
 
-/*jslint vars: true, plusplus: true, devel: true, node: true, nomen: true, indent: 4, maxerr: 50 */
-/*global unescape*/
+/*jslint vars: true, plusplus: true, devel: true, node: true, nomen: true, indent: 4, maxerr: 50, bitwise: true */
+/*global unescape, ArrayBuffer, Uint16Array */
 
 "use strict";
 
@@ -40,14 +40,57 @@ if (process.platform === "darwin") {
 var _domainManager,
     _watcherMap = {};
 
-function _addStats(obj, stats) {
-    obj.isFile = !stats.isDirectory();
-    obj.mtime = stats.mtime.getTime();
-    obj.size = stats.size;
+function _getStatsObject(stats, realpath) {
+    var obj = {
+        isFile: !stats.isDirectory(),
+        mtime: stats.mtime.getTime(),
+        size: stats.size
+    };
+
+    if (realpath) {
+        obj.realpath = realpath;
+    }
+    
     return obj;
 }
 
-function _statHelper(path) {
+function _getStatsBuffer(stats, realpath) {
+    // 1. 8 bytes for the mtime
+    // 2. 8 bytes for the size
+    // 3. 2 bytes: flags
+    // 3a.  the first bit indicates whether the entry is a file (1) or directory (0)
+    // 3b.  the remaining 15 bits are interpreted as the length in bytes of a realpath,
+    //      which may be zero
+    // 4. N bytes, for some 0 <= N < 2^15, which encodes a UTF-8 realpath string
+    
+    var realpathBytes = realpath ? realpath.length * 2 : 0,
+        fileBit = stats.isDirectory() ? 0 : 1,
+        flags = (realpathBytes << 1) | fileBit,
+        buffer = new Buffer(18 + realpathBytes);
+    
+    console.assert(realpathBytes < 32768); // 2^15
+    
+    buffer.writeDoubleLE(stats.mtime.getTime(), 0);
+    buffer.writeDoubleLE(stats.size, 8);
+    buffer.writeUInt16LE(flags, 16);
+    
+    var i = 0;
+    for (i = 0; i < realpathBytes; i++) {
+        buffer.writeUInt16LE(realpath.charCodeAt(i), (2 * i) + 18);
+    }
+    
+    return buffer;
+}
+
+function _formatStats(encoding, stats, realpath) {
+    if (encoding === null) {
+        return _getStatsBuffer(stats, realpath);
+    } else {
+        return _getStatsObject(stats, realpath);
+    }
+}
+
+function _statHelper(path, encoding) {
     var last = path.length - 1;
 
     if (path[last] === "/") {
@@ -65,10 +108,11 @@ function _statHelper(path) {
                         if (stats.isDirectory() && realpath[realpath - 1] !== "/") {
                             realpath += "/";
                         }
-                        return _addStats({realpath: realpath}, stats);
+                        
+                        return _formatStats(encoding, stats, realpath);
                     });
             } else {
-                return _addStats({}, lstats);
+                return _formatStats(encoding, lstats);
             }
         });
 }
@@ -103,19 +147,24 @@ function _strencode(data) {
 
 function _readFileHelper(path, encoding) {
     var readPromise = fs.readFileAsync(path),
-        statPromise = _statHelper(path);
+        statPromise = _statHelper(path, encoding);
     
     return Promise.join(readPromise, statPromise)
         .spread(function (data, stats) {
-            if (isBinaryFile(data, stats.size)) {
-                return Promise.rejected("Binary file");
+            var response;
+            if (encoding === null) {
+                response = Buffer.concat([stats, data], stats.length + data.length);
             } else {
-                var utf8Data = data.toString(encoding),
-                    encodedData = _strencode(utf8Data);
-                stats.data = encodedData;
-
-                return stats;
+                if (isBinaryFile(data, stats.size)) {
+                    return Promise.rejected("Binary file");
+                } else {
+                    var stringData = data.toString(encoding),
+                        encodedData = _strencode(stringData);
+                    stats.data = encodedData;
+                    response = stats;
+                }
             }
+            return response;
         });
 }
 

@@ -22,8 +22,8 @@
  */
 
 
-/*jslint vars: true, plusplus: true, devel: true, nomen: true, regexp: true, indent: 4, maxerr: 50 */
-/*global define, appshell, $, window, escape, setTimeout */
+/*jslint vars: true, plusplus: true, devel: true, nomen: true, regexp: true, indent: 4, maxerr: 50, bitwise: true */
+/*global define, appshell, $, window, escape, setTimeout, ArrayBuffer, Float64Array, Uint16Array */
 
 define(function (require, exports, module) {
     "use strict";
@@ -294,13 +294,51 @@ define(function (require, exports, module) {
     }
 
     function readFile(path, options, callback) {
-        var encoding = options.encoding || "utf8";
+        var encoding;
+        if (options.hasOwnProperty("encoding")) {
+            encoding = options.encoding;
+        } else {
+            encoding = "utf8";
+        }
         
         _enqueueRequest(function () {
             _nodeDomain.exec("readFile", path, encoding)
                 .done(function (statObj) {
-                    var data = strdecode(statObj.data),
+                    var stat, data;
+                    
+                    if (statObj instanceof ArrayBuffer) {
+                        var mtimeSizeBuffer = statObj.slice(0, 16),
+                            mtimeSizeView   = new Float64Array(mtimeSizeBuffer),
+                            flagsBuffer     = statObj.slice(16, 18),
+                            flagsView       = new Uint16Array(flagsBuffer),
+                            mtime           = mtimeSizeView[0],
+                            size            = mtimeSizeView[1],
+                            flags           = flagsView[0],
+                            isFile          = flags & 1,
+                            realpathBytes   = flags >> 1,
+                            dataBuffer      = statObj.slice(realpathBytes + 18),
+                            realpath;
+                        
+                        if (realpathBytes > 0) {
+                            var realpathBuffer = statObj.slice(18, realpathBytes + 18),
+                                realpathView = new Uint16Array(realpathBuffer);
+                            
+                            realpath = String.fromCharCode.apply(null, realpathView);
+                        }
+                        
+                        stat = _mapNodeStats({
+                            isFile: isFile,
+                            mtime: mtime,
+                            size: size,
+                            realpath: realpath
+                        });
+                        
+                        data = dataBuffer;
+                        
+                    } else {
+                        data = strdecode(statObj.data);
                         stat = _mapNodeStats(statObj);
+                    }
                     
                     callback(null, data, stat);
                 })
@@ -311,7 +349,12 @@ define(function (require, exports, module) {
     }
 
     function readAllFiles(paths, options, callback) {
-        var encoding = options.encoding || "utf8";
+        var encoding;
+        if (options.hasOwnProperty("encoding")) {
+            encoding = options.encoding;
+        } else {
+            encoding = "utf8";
+        }
         
         _enqueueRequest(function () {
             _nodeDomain.exec("readAllFiles", paths, encoding)
@@ -335,7 +378,12 @@ define(function (require, exports, module) {
     }
     
     function writeFile(path, data, options, callback) {
-        var encoding = options.encoding || "utf8";
+        var encoding;
+        if (options.hasOwnProperty("encoding")) {
+            encoding = options.encoding;
+        } else {
+            encoding = "utf8";
+        }
         
         function _finishWrite(created) {
             _enqueueRequest(function () {
