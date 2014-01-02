@@ -23,7 +23,7 @@
 
 
 /*jslint vars: true, plusplus: true, devel: true, nomen: true, regexp: true, indent: 4, maxerr: 50, bitwise: true */
-/*global define, appshell, $, window, escape, setTimeout, ArrayBuffer, Float64Array, Uint16Array */
+/*global define, appshell, $, window, escape, setTimeout, ArrayBuffer, Float64Array, Uint16Array, Uint8Array, DataView, TextDecoder */
 
 define(function (require, exports, module) {
     "use strict";
@@ -34,6 +34,8 @@ define(function (require, exports, module) {
         NodeDomain          = require("utils/NodeDomain");
     
     var FILE_WATCHER_BATCH_TIMEOUT = 200;   // 200ms - granularity of file watcher changes
+    
+    var utf8Decoder = new TextDecoder("utf-8");
     
     var _changeCallback,            // Callback to notify FileSystem of watcher changes
         _offlineCallback,           // Callback to notify FileSystem that watchers are offline
@@ -292,6 +294,59 @@ define(function (require, exports, module) {
     function strdecode(data) {
         return JSON.parse(decodeURIComponent(escape(data)));
     }
+    
+    function _decodeJSONReadResponse(response) {
+        var data = strdecode(response.data),
+            stat = _mapNodeStats(response);
+        
+        return [data, stat];
+    }
+    
+    function _decodeBinaryReadResponse(response, encoding, startIndex) {
+        if (startIndex === undefined) {
+            startIndex = 0;
+        }
+        
+        var mtimeSizeBuffer = response.slice(startIndex, startIndex + 16),
+            mtimeSizeView   = new Float64Array(mtimeSizeBuffer),
+            flagsBuffer     = response.slice(startIndex + 16, startIndex + 18),
+            flagsView       = new Uint16Array(flagsBuffer),
+            mtime           = mtimeSizeView[0],
+            size            = mtimeSizeView[1],
+            flags           = flagsView[0],
+            isFile          = flags & 1,
+            realpathBytes   = flags >> 1,
+            realpathOffset  = startIndex + realpathBytes + 18,
+            endIndex        = realpathOffset + size,
+            dataBuffer      = response.slice(realpathOffset, endIndex),
+            responseBytes   = realpathBytes + size + 18,
+            realpath,
+            data,
+            stat;
+        
+        if (realpathBytes > 0) {
+            var realpathBuffer = response.slice(18, realpathBytes + 18),
+                realpathView = new Uint16Array(realpathBuffer);
+            
+            realpath = String.fromCharCode.apply(null, realpathView);
+        }
+        
+        stat = _mapNodeStats({
+            isFile: isFile,
+            mtime: mtime,
+            size: size,
+            realpath: realpath
+        });
+
+        try {
+            // TODO: use encoding parameter to decode
+            data = utf8Decoder.decode(new Uint8Array(dataBuffer));
+        } catch (e) {
+            data = null;
+        }
+        
+        return [data, stat, responseBytes];
+    }
 
     function readFile(path, options, callback) {
         var encoding;
@@ -302,42 +357,21 @@ define(function (require, exports, module) {
         }
         
         _enqueueRequest(function () {
-            _nodeDomain.exec("readFile", path, encoding)
-                .done(function (statObj) {
-                    var stat, data;
-                    
-                    if (statObj instanceof ArrayBuffer) {
-                        var mtimeSizeBuffer = statObj.slice(0, 16),
-                            mtimeSizeView   = new Float64Array(mtimeSizeBuffer),
-                            flagsBuffer     = statObj.slice(16, 18),
-                            flagsView       = new Uint16Array(flagsBuffer),
-                            mtime           = mtimeSizeView[0],
-                            size            = mtimeSizeView[1],
-                            flags           = flagsView[0],
-                            isFile          = flags & 1,
-                            realpathBytes   = flags >> 1,
-                            dataBuffer      = statObj.slice(realpathBytes + 18),
-                            realpath;
-                        
-                        if (realpathBytes > 0) {
-                            var realpathBuffer = statObj.slice(18, realpathBytes + 18),
-                                realpathView = new Uint16Array(realpathBuffer);
-                            
-                            realpath = String.fromCharCode.apply(null, realpathView);
-                        }
-                        
-                        stat = _mapNodeStats({
-                            isFile: isFile,
-                            mtime: mtime,
-                            size: size,
-                            realpath: realpath
-                        });
-                        
-                        data = dataBuffer;
-                        
+            _nodeDomain.exec("readFile", path, null)
+                .done(function (response) {
+                    var decodedResponse;
+                    if (response instanceof ArrayBuffer) {
+                        decodedResponse = _decodeBinaryReadResponse(response, encoding);
                     } else {
-                        data = strdecode(statObj.data);
-                        stat = _mapNodeStats(statObj);
+                        decodedResponse = _decodeJSONReadResponse(response);
+                    }
+                    
+                    var data = decodedResponse[0],
+                        stat = decodedResponse[1];
+                    
+                    if (data === null) {
+                        callback(FileSystemError.UNKNOWN);
+                        return;
                     }
                     
                     callback(null, data, stat);
@@ -345,6 +379,50 @@ define(function (require, exports, module) {
                 .fail(function (err) {
                     callback(_mapNodeError(err));
                 });
+        });
+    }
+
+    function _decodeBinaryReadAllResponse(buffer, encoding) {
+        var index = 0,
+            results = [],
+            view = new DataView(buffer),
+            decodedResponse,
+            result,
+            data,
+            stat,
+            header;
+        
+        var errorResult = { err : FileSystemError.UNKNOWN };
+        
+        while (index < buffer.byteLength) {
+            header = view.getUint8(index++);
+            if (header > 0) {
+                result = errorResult;
+            } else {
+                decodedResponse = _decodeBinaryReadResponse(buffer, encoding, index);
+                data = decodedResponse[0];
+                
+                if (data === null) {
+                    result = errorResult;
+                } else {
+                    stat = decodedResponse[1];
+                    index += decodedResponse[2];
+                    result = [data, stat];
+                }
+            }
+            results.push(result);
+        }
+        
+        return results;
+    }
+    
+    function _decodeJSONReadAllResponse(results) {
+        return results.map(function (obj) {
+            if (obj.err) {
+                return _mapNodeError(obj.err);
+            } else {
+                return _decodeJSONReadResponse(obj);
+            }
         });
     }
 
@@ -357,19 +435,17 @@ define(function (require, exports, module) {
         }
         
         _enqueueRequest(function () {
-            _nodeDomain.exec("readAllFiles", paths, encoding)
-                .done(function (results) {
-                    var mappedResults = results.map(function (obj) {
-                        if (obj.err) {
-                            return _mapNodeError(obj.err);
-                        } else {
-                            var data = strdecode(obj.data),
-                                stat = _mapNodeStats(obj);
-                            
-                            return [data, stat];
-                        }
-                    });
-                    callback(null, mappedResults);
+            _nodeDomain.exec("readAllFiles", paths, null)
+                .done(function (response) {
+                    var results;
+                    
+                    if (response instanceof ArrayBuffer) {
+                        results = _decodeBinaryReadAllResponse(response, encoding);
+                    } else {
+                        results = _decodeJSONReadAllResponse(response);
+                    }
+                    
+                    callback(null, results);
                 })
                 .fail(function (err) {
                     callback(_mapNodeError(err));
@@ -477,7 +553,7 @@ define(function (require, exports, module) {
     exports.rename          = rename;
     exports.stat            = stat;
     exports.readFile        = readFile;
-    exports.readAllFiles    = readAllFiles;
+//    exports.readAllFiles    = readAllFiles;
     exports.writeFile       = writeFile;
     exports.unlink          = unlink;
     exports.initWatchers    = initWatchers;

@@ -177,14 +177,44 @@ function readAllFilesCmd(paths, encoding, callback) {
     var allPromises = paths.map(function (path) {
         return _readFileHelper(path, encoding);
     });
-    
+        
     Promise.settle(allPromises)
         .map(function (inspector) {
+            var value, response;
+            
             if (inspector.isFulfilled()) {
-                return inspector.value();
+                value = inspector.value();
+                
+                if (encoding === null) {
+                    var successHeader = new Buffer(1);
+                    successHeader.writeUInt8(0, 0);
+                    response = Buffer.concat([successHeader, value], value.length + 1);
+                } else {
+                    response = value;
+                }
             } else {
-                return {err: inspector.error()};
+                value = inspector.error();
+                
+                if (encoding === null) {
+                    var errorHeader = new Buffer(1);
+                    errorHeader.writeUInt8(1, 0); // TODO: error codes
+                    response = errorHeader;
+                } else {
+                    response = {err: value};
+                }
             }
+            
+            return response;
+        })
+        .then(function (responses) {
+            if (encoding === null) {
+                return Buffer.concat(responses);
+            } else {
+                return responses;
+            }
+        }, function (err) {
+            console.log(err);
+            throw err;
         })
         .nodeify(callback);
 }
